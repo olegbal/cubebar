@@ -90,6 +90,24 @@ Two fit in the regular layout; with more, rows switch to compact (label, bar, co
 and percent on one line), which fits 3–4 providers on the screen. Pages alternate on every refresh
 only if even that doesn't fit. Unlimited windows (e.g. the MiniMax Plus weekly one) are hidden.
 
+### Balance providers (Claude API)
+
+The Claude API credit is a balance, not a limit, so it is shown in dollars: the header carries
+`$86.34 / $100` and the row shows the expiry (`Nov 28`) instead of a percentage. The bar still
+shows the fraction left.
+
+The data comes from CodexBar's `claudeplatform` provider, which reads the Claude Console session.
+On Linux the `sessionKey` cookie has to be pasted by hand (browser import is macOS-only):
+
+```bash
+codexbar config enable --provider claudeplatform
+codexbar config set-source --provider claudeplatform --source web
+printf '%s' 'sessionKey=...' | codexbar config set-cookie --provider claudeplatform --stdin
+```
+
+Get the cookie from DevTools → Application → Cookies → `platform.claude.com` → `sessionKey`.
+It is a session cookie: when it expires the cube shows a sign-in error until a fresh one is pasted.
+
 ## How it talks to the cube
 
 - `POST /doUpload?dir=/image/` (field `file`) — upload a JPEG

@@ -12,6 +12,7 @@ import io
 import json
 import os
 import plistlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -36,6 +37,7 @@ GOOD, WARN, BAD = (52, 211, 153), (251, 191, 36), (248, 113, 113)
 
 PROVIDERS = {
     "claude": ("Claude", (217, 119, 87)),
+    "claudeplatform": ("Claude API", (230, 160, 90)),
     "codex": ("Codex", (122, 162, 247)),
     "opencode": ("OpenCode", (250, 178, 131)),
     "opencodego": ("OpenCode Go", (250, 178, 131)),
@@ -77,6 +79,8 @@ class Window:
     used: float
     resets_at: datetime | None = None
     expected_used: float | None = None
+    amount: str = ""  # money left, e.g. "$86.34 of $100.00 left"
+    expires: str = ""  # expiry, e.g. "Expires Nov 28 (UTC)"
 
 
 @dataclass
@@ -90,6 +94,20 @@ class Provider:
 
     def height(self, layout):
         return layout.provider_h + max(len(self.windows), 1) * layout.row_h
+
+    def headline(self):
+        """Right side of the header: the money left if the provider reports one, else the plan."""
+        for w in self.windows:
+            if w.amount:
+                return short_amount(w.amount)
+        return self.plan
+
+    def short_headline(self):
+        """Same, but without the total: "$86.34" out of "$86.34/$100"."""
+        for w in self.windows:
+            if w.amount:
+                return short_amount(w.amount).split("/")[0].strip()
+        return self.plan
 
 
 def parse_time(value):
@@ -114,23 +132,77 @@ def plan_label(usage):
     return plan[:1].upper() + plan[1:] if plan else ""
 
 
+def split_amount(text):
+    """Split a provider description into the money part and the expiry part.
+
+    CodexBar reports a credit balance as a rate window (a percentage) plus a
+    human description like "$86.34 of $100.00 left · Expires Nov 28 (UTC)".
+    """
+    if not text:
+        return "", ""
+    parts = [p.strip() for p in str(text).split("·")]
+    return parts[0], parts[1] if len(parts) > 1 else ""
+
+
+def short_amount(text):
+    """Trim the money text so it fits the header: "$86.34 of $100.00 left" -> "$86.34 / $100"."""
+    text = re.sub(r"\s+left$", "", text)
+    text = re.sub(r"\.00\b", "", text)
+    return re.sub(r"\s+of\s+", " / ", text)
+
+
+def short_expires(text):
+    """Trim an expiry to the short form: "Expires Nov 28 (UTC)" -> "Nov 28"."""
+    text = re.sub(r"^Expires\s+", "", text)
+    return re.sub(r"\s*\(UTC\)$", "", text)
+
+
+def fit_text(draw, text, font, max_w):
+    """Cut a string with an ellipsis so it fits max_w pixels."""
+    if not text or draw.textlength(text, font=font) <= max_w:
+        return text
+    while text and draw.textlength(text + "…", font=font) > max_w:
+        text = text[:-1]
+    return text + "…"
+
+
+def compact_label(draw, text, font, max_w):
+    """Shorten a window label for the narrow compact column."""
+    if draw.textlength(text, font=font) <= max_w:
+        return text
+    words = text.split()
+    if len(words) > 1:
+        cand = words[-1][:1].upper() + words[-1][1:]
+        if draw.textlength(cand, font=font) <= max_w:
+            return cand
+    return fit_text(draw, text, font, max_w)
+
+
 def parse_entry(entry, include_extra=True):
     pid = entry.get("provider", "?")
     name, accent = PROVIDERS.get(pid, (pid.title(), (200, 200, 200)))
     usage = entry.get("usage") or {}
     pace = entry.get("pace") or {}
     p = Provider(pid, name, accent, plan_label(usage))
+    labels = entry.get("rateWindowLabels") or {}
 
     unlimited = []
     for key in ("primary", "secondary", "tertiary"):
         w = usage.get(key)
         if not w or w.get("usedPercent") is None:
             continue
+        amount, expires = split_amount(w.get("resetDescription"))
+        # A window with a reset time shows a countdown; a balance window shows the money instead.
+        if w.get("resetsAt"):
+            amount, expires = "", ""
         window = Window(
-            label=window_label(w.get("windowMinutes")),
+            label=(window_label(w.get("windowMinutes")) if w.get("windowMinutes")
+                   else labels.get(key) or "?"),
             used=float(w["usedPercent"]),
             resets_at=parse_time(w.get("resetsAt")),
             expected_used=(pace.get(key) or {}).get("expectedUsedPercent"),
+            amount=amount,
+            expires=expires,
         )
         # An unlimited window (e.g. MiniMax Plus weekly) is always 100% left: skip it unless it's all there is.
         if (w.get("resetDescription") or "").strip().lower() == "unlimited":
@@ -271,10 +343,13 @@ def draw_window(draw, y, w, now, show_used):
     x0, x1 = PAD, SIZE - PAD
 
     draw.text((x0, y), w.label, font=FONTS.get(14, "Medium"), fill=DIM)
-    x = text_right(draw, x1, y - 1, f"{value:.0f}%", FONTS.get(16, "Bold"), color)
+    # A balance window reports money, not a percentage: the amount sits in the header instead.
+    x = x1 if w.amount else text_right(draw, x1, y - 1, f"{value:.0f}%", FONTS.get(16, "Bold"), color)
     countdown = fmt_countdown(w.resets_at, now)
     if countdown:
         text_right(draw, x - 8, y + 1, countdown, FONTS.get(13), DIM)
+    elif w.expires:
+        text_right(draw, x - 8, y + 1, short_expires(w.expires), FONTS.get(13), DIM)
 
     by = y + ROW_TEXT_H + 2
     draw.rounded_rectangle((x0, by, x1, by + BAR_H), radius=BAR_H // 2, fill=TRACK)
@@ -296,11 +371,14 @@ def draw_window_compact(draw, y, w, now, show_used):
     pct_right, cd_right = x1, x1 - 47
     bar_x0, bar_x1 = x0 + 42, cd_right - 43
 
-    draw.text((x0, y + 1), w.label, font=FONTS.get(13, "Medium"), fill=DIM)
-    text_right(draw, pct_right, y, f"{value:.0f}%", FONTS.get(14, "Bold"), color)
+    draw.text((x0, y + 1), compact_label(draw, w.label, FONTS.get(13, "Medium"), 40), font=FONTS.get(13, "Medium"), fill=DIM)
+    if not w.amount:
+        text_right(draw, pct_right, y, f"{value:.0f}%", FONTS.get(14, "Bold"), color)
     countdown = fmt_countdown(w.resets_at, now)
     if countdown:
         text_right(draw, cd_right, y + 2, countdown, FONTS.get(12), DIM)
+    elif w.expires:
+        text_right(draw, cd_right, y + 2, short_expires(w.expires), FONTS.get(12), DIM)
 
     bh = BAR_H - 1
     by = y + 6
@@ -317,14 +395,26 @@ def draw_window_compact(draw, y, w, now, show_used):
 def draw_provider(draw, y, p, now, show_used, layout):
     if layout.compact:
         draw.ellipse((PAD, y + 5, PAD + 8, y + 13), fill=p.accent)
-        draw.text((PAD + 14, y), p.name, font=FONTS.get(15, "Bold"), fill=FG)
-        if p.plan:
-            text_right(draw, SIZE - PAD, y + 2, p.plan, FONTS.get(12, "Medium"), DIM)
+        name_font = FONTS.get(15, "Bold")
+        draw.text((PAD + 14, y), p.name, font=name_font, fill=FG)
+        head, head_font, head_y = p.headline(), FONTS.get(12, "Medium"), y + 2
     else:
         draw.ellipse((PAD, y + 6, PAD + 8, y + 14), fill=p.accent)
-        draw.text((PAD + 14, y), p.name, font=FONTS.get(17, "Bold"), fill=FG)
-        if p.plan:
-            text_right(draw, SIZE - PAD, y + 3, p.plan, FONTS.get(13, "Medium"), DIM)
+        name_font = FONTS.get(17, "Bold")
+        draw.text((PAD + 14, y), p.name, font=name_font, fill=FG)
+        head, head_font, head_y = p.headline(), FONTS.get(13, "Medium"), y + 3
+    if head:
+        # Keep the money and the provider name from colliding.
+        avail = max(0, SIZE - PAD - (PAD + 14 + draw.textlength(p.name, font=name_font)) - 6)
+        text = fit_text(draw, head, head_font, avail)
+        if text.endswith("…"):
+            # The full amount did not fit: show what is left without the total.
+            alt = p.short_headline()
+            text = fit_text(draw, alt, head_font, avail) if alt else ""
+            if text.endswith("…"):
+                text = ""
+        if text:
+            text_right(draw, SIZE - PAD, head_y, text, head_font, DIM)
     y += layout.provider_h
     if p.error:
         lines = textwrap.wrap(p.error, 32, max_lines=1 if layout.compact else 2, placeholder="…")
